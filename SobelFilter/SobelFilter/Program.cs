@@ -4,6 +4,7 @@ using ManagedCuda.VectorTypes;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace SobelFilter
 {
@@ -13,25 +14,19 @@ namespace SobelFilter
         {
             const string inputPath = @"C:\Users\t-fegasp\Pictures\kitten.jpg";
             const string outputPath = @"C:\Users\t-fegasp\Pictures\kitten.out.jpg";
-            // singleThreadedSobel(inputPath, outputPath);
-            // GPUSobel(inputPath, outputPath);
-            parallelSobel(inputPath, outputPath);
+
+            Bitmap image = loadImageTo32bppFormat(inputPath);
+            byte[] grayData = ConvertTo8bpp(image);
+            Int64 sTicks = singleThreadedSobel(image, grayData);
+            // Int64 sTicks = GPUSobel(image, grayData);
+            Int64 pTicks = parallelSobel(image, grayData);
+            Console.WriteLine($"Single took: {sTicks} ticks. Parallel took: {pTicks} ticks. Speedup was {(double)sTicks / (double)pTicks}.");
+            image.Save(outputPath);
+            Console.ReadKey();
         }
 
-        unsafe static public void GPUSobel(string inputPath, string outputPath)
+        unsafe static public Int64 GPUSobel(Bitmap image, byte[] grayData)
         {
-            DateTime start = DateTime.Now;
-
-            Bitmap image = new Bitmap(inputPath);
-            if (image.PixelFormat != PixelFormat.Format32bppArgb
-                && image.PixelFormat != PixelFormat.Format32bppRgb)
-            {
-                image = image.Clone(new Rectangle(0, 0, image.Width, image.Height), PixelFormat.Format32bppArgb);
-            }
-
-            // Obtain grayscale conversion of the image
-            byte[] grayData = ConvertTo8bpp(image);
-
             int width = image.Width;
             int height = image.Height;
 
@@ -49,7 +44,10 @@ namespace SobelFilter
             int stride = imageData.Stride / 4; // Stride is the width of one pixel row, including any padding. In bytes, /4 converts to 4 byte pixels
             CudaDeviceVariable<byte> deviceGrayData = grayData;
             CudaDeviceVariable<uint> output = new CudaDeviceVariable<uint>(width * height);
+            Stopwatch sw = Stopwatch.StartNew();
             kernel.Run(deviceGrayData.DevicePointer, output.DevicePointer, width, height);
+            sw.Stop();
+            Int64 ticks = sw.ElapsedTicks;
 
             uint[] filteredImage = output;
             int index = 0;
@@ -72,32 +70,12 @@ namespace SobelFilter
             }
             // Finish with image and save
             image.UnlockBits(imageData);
-            image.Save(outputPath);
 
-            TimeSpan duration = DateTime.Now - start;
-            Console.WriteLine("Finished in {0} milliseconds.", Math.Round(duration.TotalMilliseconds));
-            Console.ReadKey();
+            return ticks;
         }
-    
-        public static Bitmap load32bppImage(string inputPath)
+
+        unsafe static public Int64 parallelSobel(Bitmap image, byte[] grayData)
         {
-            Bitmap image = new Bitmap(inputPath);
-
-            if (image.PixelFormat != PixelFormat.Format32bppArgb
-                && image.PixelFormat != PixelFormat.Format32bppRgb)
-            {
-                image = image.Clone(new Rectangle(0, 0, image.Width, image.Height), PixelFormat.Format32bppArgb);
-            }
-
-            return image;
-        }
-        unsafe static public void parallelSobel(string inputPath, string outputPath)
-        {
-            DateTime start = DateTime.Now;
-
-            Bitmap image = load32bppImage(inputPath);
-            byte[] grayData = ConvertTo8bpp(image);
-
             int width = image.Width;
             int height = image.Height;
 
@@ -109,6 +87,7 @@ namespace SobelFilter
             int processorCount = Environment.ProcessorCount;
             int rowChunkSize = (height + processorCount - 1) / processorCount;
             Console.WriteLine($"We have {processorCount} processors. The width is {width} and the height is {height}. So the rowChunkSize is {rowChunkSize}.");
+            Stopwatch sw = Stopwatch.StartNew();
             Parallel.For(0, Environment.ProcessorCount, i =>
             {
                 int rowsFrom = i * rowChunkSize;
@@ -122,7 +101,6 @@ namespace SobelFilter
                     rowsTo = height - 1;
                 }
                 byte[] buffer = new byte[9];
-                Console.WriteLine($"Processor {i}: rowsFrom = {rowsFrom} and rowsTo = {rowsTo}");
                 for (int y = rowsFrom; y < rowsTo; ++y)
                 {
                     for (int x = 1; x < width - 1; ++x)
@@ -146,6 +124,9 @@ namespace SobelFilter
                     }
                 }
             });
+            sw.Stop();
+            Int64 ticks = sw.ElapsedTicks;
+
             for (int x = 0; x < width; ++x)
             {
                 *(ptr + (height - 1) * stride + x) = 0;
@@ -156,39 +137,27 @@ namespace SobelFilter
                 *(ptr + y * stride) = 0;
                 *(ptr + y * stride + width - 1) = 0;
             }
-            // Finish with image and save
+            // Release image
             image.UnlockBits(imageData);
-            image.Save(outputPath);
 
-            TimeSpan duration = DateTime.Now - start;
-            Console.WriteLine("Finished in {0} milliseconds.", Math.Round(duration.TotalMilliseconds));
-            Console.ReadKey();
+            return ticks;
         }
 
-        unsafe static public void singleThreadedSobel(string inputPath, string outputPath)
+        unsafe static public Int64 singleThreadedSobel(Bitmap image, byte[] grayData)
         {
-            DateTime start = DateTime.Now;
-            Bitmap image = load32bppImage(inputPath);
-            
-            // Obtain grayscale conversion of the image
-            byte[] grayData = ConvertTo8bpp(image);
-
             int width = image.Width;
             int height = image.Height;
 
-            // Buffers
             byte[] buffer = new byte[9];
             BitmapData imageData = image.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadWrite, image.PixelFormat);
-
-            uint* ptr = (uint*)imageData.Scan0.ToPointer(); // An unsigned int pointer. This points to the image data in memory, each uint is one pixel ARGB
-            int stride = imageData.Stride / 4; // Stride is the width of one pixel row, including any padding. In bytes, /4 converts to 4 byte pixels 
-
+            uint* ptr = (uint*)imageData.Scan0.ToPointer();
+            int stride = imageData.Stride / 4;
+            Stopwatch sw = Stopwatch.StartNew();
             for (int y = 1; y < height - 1; y++)
             {
                 for (int x = 1; x < width - 1; x++)
                 {
                     int index = y * width + x;
-                    // 3x3 window around (x,y)
                     buffer[0] = grayData[index - width - 1];
                     buffer[1] = grayData[index - width];
                     buffer[2] = grayData[index - width + 1];
@@ -206,6 +175,9 @@ namespace SobelFilter
                     *(ptr + y * stride + x) = (0xFF000000 | (uint)(grayMag << 16) | (uint)(grayMag << 8) | grayMag);
                 }
             }
+            sw.Stop();
+            Int64 ticks = sw.ElapsedTicks;
+
             for (int x = 0; x < width; ++x)
             {
                 *(ptr + (height - 1) * stride + x) = 0;
@@ -216,13 +188,23 @@ namespace SobelFilter
                 *(ptr + y * stride) = 0;
                 *(ptr + y * stride + width - 1) = 0;
             }
-            // Finish with image and save
+            // Release lock
             image.UnlockBits(imageData);
-            image.Save(outputPath);
 
-            TimeSpan duration = DateTime.Now - start;
-            Console.WriteLine("Finished in {0} milliseconds.", Math.Round(duration.TotalMilliseconds));
-            Console.ReadKey();
+            return ticks;
+        }
+
+        public static Bitmap loadImageTo32bppFormat(string inputPath)
+        {
+            Bitmap image = new Bitmap(inputPath);
+
+            if (image.PixelFormat != PixelFormat.Format32bppArgb
+                && image.PixelFormat != PixelFormat.Format32bppRgb)
+            {
+                image = image.Clone(new Rectangle(0, 0, image.Width, image.Height), PixelFormat.Format32bppArgb);
+            }
+
+            return image;
         }
 
         unsafe public static byte[] ConvertTo8bpp(Bitmap image)
