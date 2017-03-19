@@ -3,6 +3,7 @@ using ManagedCuda;
 using ManagedCuda.VectorTypes;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Threading.Tasks;
 
 namespace SobelFilter
 {
@@ -13,7 +14,8 @@ namespace SobelFilter
             const string inputPath = @"C:\Users\t-fegasp\Pictures\kitten.jpg";
             const string outputPath = @"C:\Users\t-fegasp\Pictures\kitten.out.jpg";
             // singleThreadedSobel(inputPath, outputPath);
-            GPUSobel(inputPath, outputPath);
+            // GPUSobel(inputPath, outputPath);
+            parallelSobel(inputPath, outputPath);
         }
 
         unsafe static public void GPUSobel(string inputPath, string outputPath)
@@ -76,18 +78,98 @@ namespace SobelFilter
             Console.WriteLine("Finished in {0} milliseconds.", Math.Round(duration.TotalMilliseconds));
             Console.ReadKey();
         }
-
-        unsafe static public void singleThreadedSobel(string inputPath, string outputPath)
+    
+        public static Bitmap load32bppImage(string inputPath)
         {
-            DateTime start = DateTime.Now;
             Bitmap image = new Bitmap(inputPath);
-            
+
             if (image.PixelFormat != PixelFormat.Format32bppArgb
                 && image.PixelFormat != PixelFormat.Format32bppRgb)
             {
                 image = image.Clone(new Rectangle(0, 0, image.Width, image.Height), PixelFormat.Format32bppArgb);
             }
 
+            return image;
+        }
+        unsafe static public void parallelSobel(string inputPath, string outputPath)
+        {
+            DateTime start = DateTime.Now;
+
+            Bitmap image = load32bppImage(inputPath);
+            byte[] grayData = ConvertTo8bpp(image);
+
+            int width = image.Width;
+            int height = image.Height;
+
+            BitmapData imageData = image.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadWrite, image.PixelFormat);
+
+            uint* ptr = (uint*)imageData.Scan0.ToPointer();
+            int stride = imageData.Stride / 4;
+
+            int processorCount = Environment.ProcessorCount;
+            int rowChunkSize = (height + processorCount - 1) / processorCount;
+            Console.WriteLine($"We have {processorCount} processors. The width is {width} and the height is {height}. So the rowChunkSize is {rowChunkSize}.");
+            Parallel.For(0, Environment.ProcessorCount, i =>
+            {
+                int rowsFrom = i * rowChunkSize;
+                if (rowsFrom == 0)
+                {
+                    rowsFrom = 1;
+                }
+                int rowsTo = (i + 1) * rowChunkSize;
+                if (rowsTo > height - 1)
+                {
+                    rowsTo = height - 1;
+                }
+                byte[] buffer = new byte[9];
+                Console.WriteLine($"Processor {i}: rowsFrom = {rowsFrom} and rowsTo = {rowsTo}");
+                for (int y = rowsFrom; y < rowsTo; ++y)
+                {
+                    for (int x = 1; x < width - 1; ++x)
+                    {
+                        int index = y * width + x;
+                        buffer[0] = grayData[index - width - 1];
+                        buffer[1] = grayData[index - width];
+                        buffer[2] = grayData[index - width + 1];
+                        buffer[3] = grayData[index - 1];
+                        buffer[4] = grayData[index];
+                        buffer[5] = grayData[index + 1];
+                        buffer[6] = grayData[index + width - 1];
+                        buffer[7] = grayData[index + width];
+                        buffer[8] = grayData[index + width + 1];
+
+                        double dx = buffer[2] + 2 * buffer[5] + buffer[8] - buffer[0] - 2 * buffer[3] - buffer[6];
+                        double dy = buffer[6] + 2 * buffer[7] + buffer[8] - buffer[0] - 2 * buffer[1] - buffer[2];
+                        double magnitude = Math.Sqrt(dx * dx + dy * dy) / 1141; // 1141 is approximately the max sobel response
+                        byte grayMag = Convert.ToByte(magnitude * 255);
+                        *(ptr + y * stride + x) = (0xFF000000 | (uint)(grayMag << 16) | (uint)(grayMag << 8) | grayMag);
+                    }
+                }
+            });
+            for (int x = 0; x < width; ++x)
+            {
+                *(ptr + (height - 1) * stride + x) = 0;
+                *(ptr + x) = 0;
+            }
+            for (int y = 0; y < height; ++y)
+            {
+                *(ptr + y * stride) = 0;
+                *(ptr + y * stride + width - 1) = 0;
+            }
+            // Finish with image and save
+            image.UnlockBits(imageData);
+            image.Save(outputPath);
+
+            TimeSpan duration = DateTime.Now - start;
+            Console.WriteLine("Finished in {0} milliseconds.", Math.Round(duration.TotalMilliseconds));
+            Console.ReadKey();
+        }
+
+        unsafe static public void singleThreadedSobel(string inputPath, string outputPath)
+        {
+            DateTime start = DateTime.Now;
+            Bitmap image = load32bppImage(inputPath);
+            
             // Obtain grayscale conversion of the image
             byte[] grayData = ConvertTo8bpp(image);
 
